@@ -1716,6 +1716,7 @@ def create_item(
     tags: list[str] | str | None = None,
     collections: list[str] | str | None = None,
     extra_fields: dict[str, str] | str | None = None,
+    file_path: str | None = None,
     *,
     ctx: Context
 ) -> str:
@@ -1746,6 +1747,8 @@ def create_item(
                       {"publicationTitle": "Nature", "volume": "42",
                        "issue": "3", "pages": "100-115",
                        "publisher": "Springer", "language": "en"})
+        file_path: Optional absolute path to a file (PDF, etc.) to upload
+                   as an attachment to the newly created item
         ctx: MCP context
 
     Returns:
@@ -1829,6 +1832,50 @@ def create_item(
                 if collections:
                     output.append(f"**Collections:** {', '.join(collections)}")
 
+                # Upload file attachment if provided
+                if file_path:
+                    filepath = Path(file_path)
+                    if not filepath.exists():
+                        output.extend([
+                            "",
+                            f"**Warning:** File not found at `{file_path}` — "
+                            "item was created but no attachment was uploaded.",
+                        ])
+                    elif not filepath.is_file():
+                        output.extend([
+                            "",
+                            f"**Warning:** Path is not a file: `{file_path}` — "
+                            "item was created but no attachment was uploaded.",
+                        ])
+                    else:
+                        try:
+                            att_result = zot.attachment_simple(
+                                [str(filepath)], parentid=item_key
+                            )
+                            if "success" in att_result and att_result["success"]:
+                                att_success = att_result["success"]
+                                att_idx = next(iter(att_success.keys()))
+                                att_key = att_success[att_idx]
+                                output.extend([
+                                    "",
+                                    "## Attachment Uploaded",
+                                    f"**File:** {filepath.name}",
+                                    f"**Attachment Key:** {att_key}",
+                                    f"**Size:** {filepath.stat().st_size:,} bytes",
+                                ])
+                            else:
+                                output.extend([
+                                    "",
+                                    f"**Warning:** Item created but attachment "
+                                    f"upload failed: {att_result.get('failure', 'Unknown error')}",
+                                ])
+                        except Exception as att_err:
+                            output.extend([
+                                "",
+                                f"**Warning:** Item created but attachment "
+                                f"upload failed: {str(att_err)}",
+                            ])
+
                 return "\n".join(output)
             else:
                 return f"Item creation response was successful but no key was returned: {result}"
@@ -1842,6 +1889,202 @@ def create_item(
     except Exception as e:
         ctx.error(f"Error creating item: {str(e)}")
         return f"Error creating item: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_create_collection",
+    description="Create a new collection (or subcollection) in your Zotero library."
+)
+def create_collection(
+    name: str,
+    parent_collection: str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Create a new collection or subcollection in your Zotero library.
+
+    Args:
+        name: Name of the collection to create
+        parent_collection: Key of the parent collection to nest under
+                           (omit for a top-level collection). Use
+                           zotero_get_collections to find existing keys.
+        ctx: MCP context
+
+    Returns:
+        Confirmation with the new collection key
+    """
+    try:
+        ctx.info(f"Creating collection: {name}")
+        zot = get_zotero_client()
+
+        payload = {"name": name}
+        if parent_collection:
+            payload["parentCollection"] = parent_collection
+
+        result = zot.create_collections([payload])
+
+        if "success" in result and result["success"]:
+            successful = result["success"]
+            if successful:
+                coll_index = next(iter(successful.keys()))
+                coll_key = successful[coll_index]
+
+                output = [
+                    "# Collection Created Successfully",
+                    "",
+                    f"**Name:** {name}",
+                    f"**Collection Key:** {coll_key}",
+                ]
+                if parent_collection:
+                    output.append(f"**Parent Collection:** {parent_collection}")
+                else:
+                    output.append("**Level:** Top-level collection")
+
+                return "\n".join(output)
+            else:
+                return f"Collection creation succeeded but no key returned: {result}"
+        else:
+            failed = result.get("failed", {})
+            return f"Failed to create collection: {failed}"
+
+    except Exception as e:
+        ctx.error(f"Error creating collection: {str(e)}")
+        return f"Error creating collection: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_add_to_collection",
+    description="Add an existing Zotero item to a collection."
+)
+def add_to_collection(
+    item_key: str,
+    collection_key: str,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Add an existing item to a collection.
+
+    Args:
+        item_key: Key of the item to add
+        collection_key: Key of the target collection
+        ctx: MCP context
+
+    Returns:
+        Confirmation message
+    """
+    try:
+        ctx.info(f"Adding item {item_key} to collection {collection_key}")
+        zot = get_zotero_client()
+
+        # Fetch the full item (required by pyzotero's addto_collection)
+        try:
+            item = zot.item(item_key)
+        except Exception:
+            return f"Error: No item found with key: {item_key}"
+
+        item_title = item["data"].get("title", "Untitled")
+
+        result = zot.addto_collection(collection_key, item)
+
+        # addto_collection returns a truthy response on success
+        if result:
+            return (
+                f"# Item Added to Collection\n\n"
+                f"**Item:** {item_title} ({item_key})\n"
+                f"**Collection:** {collection_key}"
+            )
+        else:
+            return f"Failed to add item {item_key} to collection {collection_key}"
+
+    except Exception as e:
+        ctx.error(f"Error adding item to collection: {str(e)}")
+        return f"Error adding item to collection: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_upload_attachment",
+    description="Upload a file (PDF, document, etc.) as an attachment to an "
+    "existing Zotero item, or as a standalone top-level attachment."
+)
+def upload_attachment(
+    file_path: str,
+    parent_item: str | None = None,
+    title: str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Upload a file as an attachment to a Zotero item.
+
+    Args:
+        file_path: Absolute path to the file to upload (e.g.,
+                   "/Users/me/Downloads/paper.pdf")
+        parent_item: Key of the parent item to attach to. If omitted,
+                     creates a standalone top-level attachment.
+        title: Custom title for the attachment. If omitted, the
+               filename is used as the title.
+        ctx: MCP context
+
+    Returns:
+        Confirmation with the attachment key
+    """
+    try:
+        ctx.info(f"Uploading attachment: {file_path}")
+        zot = get_zotero_client()
+
+        # Validate the file exists
+        filepath = Path(file_path)
+        if not filepath.exists():
+            return f"Error: File not found: {file_path}"
+        if not filepath.is_file():
+            return f"Error: Path is not a file: {file_path}"
+
+        # If a custom title is provided, use attachment_both; otherwise simple
+        if title:
+            result = zot.attachment_both(
+                [(title, str(filepath))],
+                parentid=parent_item,
+            )
+        else:
+            result = zot.attachment_simple(
+                [str(filepath)],
+                parentid=parent_item,
+            )
+
+        # Check result
+        if "success" in result and result["success"]:
+            successful = result["success"]
+            if successful:
+                att_index = next(iter(successful.keys()))
+                att_key = successful[att_index]
+
+                output = [
+                    "# Attachment Uploaded Successfully",
+                    "",
+                    f"**File:** {filepath.name}",
+                    f"**Attachment Key:** {att_key}",
+                ]
+                if title:
+                    output.append(f"**Title:** {title}")
+                if parent_item:
+                    output.append(f"**Parent Item:** {parent_item}")
+                else:
+                    output.append("**Type:** Standalone (top-level) attachment")
+                output.append(f"**Size:** {filepath.stat().st_size:,} bytes")
+
+                return "\n".join(output)
+            else:
+                return f"Upload succeeded but no attachment key returned: {result}"
+        elif "failure" in result and result["failure"]:
+            return f"Failed to upload attachment: {result['failure']}"
+        else:
+            return f"Unexpected upload result: {result}"
+
+    except Exception as e:
+        ctx.error(f"Error uploading attachment: {str(e)}")
+        return f"Error uploading attachment: {str(e)}"
 
 
 @mcp.tool(
