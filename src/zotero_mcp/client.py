@@ -336,3 +336,96 @@ def convert_to_markdown(file_path: str | Path) -> str:
         return result.text_content
     except Exception as e:
         return f"Error converting file to markdown: {str(e)}"
+
+
+def create_zotero_item(
+    zot: zotero.Zotero,
+    item_type: str,
+    title: str,
+    creators: list[dict[str, str]] | None = None,
+    date: str | None = None,
+    abstract: str | None = None,
+    url: str | None = None,
+    doi: str | None = None,
+    tags: list[str] | None = None,
+    collections: list[str] | None = None,
+    extra_fields: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """
+    Create a new item in Zotero.
+
+    Args:
+        zot: A Zotero client instance.
+        item_type: Zotero item type (e.g., journalArticle, book, webpage).
+        title: Title of the item.
+        creators: List of creator dicts with keys like firstName, lastName,
+                  creatorType. Defaults to creatorType "author" if omitted.
+        date: Publication date string.
+        abstract: Abstract or description text.
+        url: URL associated with the item.
+        doi: DOI identifier.
+        tags: List of tag strings.
+        collections: List of collection keys to add the item to.
+        extra_fields: Additional Zotero fields as key-value pairs.
+
+    Returns:
+        The API response dict from pyzotero create_items().
+
+    Raises:
+        ValueError: If the item type is invalid or creation fails.
+    """
+    # Get the item template for the given type
+    try:
+        template = zot.item_template(item_type)
+    except Exception as e:
+        raise ValueError(
+            f"Invalid item type '{item_type}'. Error: {e}"
+        )
+
+    # Fill in core fields
+    template["title"] = title
+
+    if date:
+        template["date"] = date
+    if abstract and "abstractNote" in template:
+        template["abstractNote"] = abstract
+    if url and "url" in template:
+        template["url"] = url
+    if doi and "DOI" in template:
+        template["DOI"] = doi
+
+    # Creators
+    if creators:
+        formatted_creators = []
+        for c in creators:
+            creator = {
+                "creatorType": c.get("creatorType", "author"),
+            }
+            if "lastName" in c and "firstName" in c:
+                creator["lastName"] = c["lastName"]
+                creator["firstName"] = c["firstName"]
+            elif "name" in c:
+                creator["name"] = c["name"]
+            elif "lastName" in c:
+                creator["lastName"] = c["lastName"]
+                creator["firstName"] = c.get("firstName", "")
+            formatted_creators.append(creator)
+        template["creators"] = formatted_creators
+
+    # Tags
+    if tags:
+        template["tags"] = [{"tag": t} for t in tags]
+
+    # Collections
+    if collections:
+        template["collections"] = collections
+
+    # Extra fields — set any additional fields present in the template
+    if extra_fields:
+        for field, value in extra_fields.items():
+            if field in template:
+                template[field] = value
+
+    # Create the item
+    result = zot.create_items([template])
+    return result

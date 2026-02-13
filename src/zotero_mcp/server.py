@@ -19,6 +19,7 @@ from fastmcp import Context, FastMCP
 
 from zotero_mcp.client import (
     convert_to_markdown,
+    create_zotero_item,
     format_item_metadata,
     generate_bibtex,
     get_attachment_details,
@@ -1698,6 +1699,298 @@ def create_note(
     except Exception as e:
         ctx.error(f"Error creating note: {str(e)}")
         return f"Error creating note: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_create_item",
+    description="Create a new item (document) in your Zotero library."
+)
+def create_item(
+    item_type: str,
+    title: str,
+    creators: list[dict[str, str]] | str | None = None,
+    date: str | None = None,
+    abstract: str | None = None,
+    url: str | None = None,
+    doi: str | None = None,
+    tags: list[str] | str | None = None,
+    collections: list[str] | str | None = None,
+    extra_fields: dict[str, str] | str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Create a new item (document) in your Zotero library.
+
+    Args:
+        item_type: Zotero item type. Common types: journalArticle, book,
+                   bookSection, conferencePaper, webpage, report, thesis,
+                   patent, presentation, document, note, attachment,
+                   videoRecording, podcast, magazineArticle, newspaperArticle,
+                   blogPost, letter, manuscript, map, statute, case, hearing,
+                   film, artwork, computerProgram, encyclopediaArticle,
+                   dictionaryEntry, interview, preprint
+        title: Title of the item
+        creators: List of creator objects, each with keys like:
+                  - firstName, lastName (and optional creatorType, default "author")
+                  - OR name (for single-field names like organizations)
+                  Examples: [{"firstName": "Jane", "lastName": "Doe"}],
+                  [{"name": "World Health Organization", "creatorType": "author"}]
+        date: Publication date (e.g., "2024-01-15", "2024", "January 2024")
+        abstract: Abstract or description text
+        url: URL associated with the item
+        doi: DOI identifier (e.g., "10.1000/xyz123")
+        tags: List of tags to apply (e.g., ["machine-learning", "review"])
+        collections: List of collection keys to add the item to
+        extra_fields: Additional Zotero fields as key-value pairs (e.g.,
+                      {"publicationTitle": "Nature", "volume": "42",
+                       "issue": "3", "pages": "100-115",
+                       "publisher": "Springer", "language": "en"})
+        ctx: MCP context
+
+    Returns:
+        Confirmation message with the new item key
+    """
+    try:
+        ctx.info(f"Creating new {item_type} item: {title}")
+
+        # Parse JSON strings if needed
+        if creators and isinstance(creators, str):
+            try:
+                creators = json.loads(creators)
+            except json.JSONDecodeError:
+                return f"Error: creators must be a list of objects or valid JSON string, got: {creators}"
+
+        if tags and isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                return f"Error: tags must be a list of strings or valid JSON string, got: {tags}"
+
+        if collections and isinstance(collections, str):
+            try:
+                collections = json.loads(collections)
+            except json.JSONDecodeError:
+                return f"Error: collections must be a list of strings or valid JSON string, got: {collections}"
+
+        if extra_fields and isinstance(extra_fields, str):
+            try:
+                extra_fields = json.loads(extra_fields)
+            except json.JSONDecodeError:
+                return f"Error: extra_fields must be a dict or valid JSON string, got: {extra_fields}"
+
+        zot = get_zotero_client()
+
+        result = create_zotero_item(
+            zot=zot,
+            item_type=item_type,
+            title=title,
+            creators=creators,
+            date=date,
+            abstract=abstract,
+            url=url,
+            doi=doi,
+            tags=tags,
+            collections=collections,
+            extra_fields=extra_fields,
+        )
+
+        # Check if creation was successful
+        if "success" in result and result["success"]:
+            successful = result["success"]
+            if successful:
+                item_index = next(iter(successful.keys()))
+                item_key = successful[item_index]
+
+                output = [
+                    f"# Item Created Successfully",
+                    "",
+                    f"**Title:** {title}",
+                    f"**Type:** {item_type}",
+                    f"**Item Key:** {item_key}",
+                ]
+
+                if creators:
+                    creator_names = []
+                    for c in creators:
+                        if "lastName" in c and "firstName" in c:
+                            creator_names.append(f"{c['lastName']}, {c['firstName']}")
+                        elif "name" in c:
+                            creator_names.append(c["name"])
+                    if creator_names:
+                        output.append(f"**Authors:** {'; '.join(creator_names)}")
+
+                if date:
+                    output.append(f"**Date:** {date}")
+                if doi:
+                    output.append(f"**DOI:** {doi}")
+                if tags:
+                    output.append(f"**Tags:** {', '.join(tags)}")
+                if collections:
+                    output.append(f"**Collections:** {', '.join(collections)}")
+
+                return "\n".join(output)
+            else:
+                return f"Item creation response was successful but no key was returned: {result}"
+        else:
+            failed = result.get("failed", {})
+            return f"Failed to create item: {failed}"
+
+    except ValueError as ve:
+        ctx.error(f"Validation error creating item: {str(ve)}")
+        return f"Error creating item: {str(ve)}"
+    except Exception as e:
+        ctx.error(f"Error creating item: {str(e)}")
+        return f"Error creating item: {str(e)}"
+
+
+@mcp.tool(
+    name="zotero_save_ai_summary",
+    description="Save an AI-generated summary as a note attached to a Zotero item. "
+    "Use this after generating a summary from an item's full text "
+    "(retrieved via zotero_get_item_fulltext)."
+)
+def save_ai_summary(
+    item_key: str,
+    summary: str,
+    summary_type: str = "brief",
+    tags: list[str] | str | None = None,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Save an AI-generated summary as a structured note attached to a Zotero item.
+
+    Typical workflow:
+      1. Call zotero_get_item_fulltext to retrieve the PDF/document text
+      2. Generate a summary from the full text
+      3. Call this tool to save the summary as a tagged note
+
+    Args:
+        item_key: Zotero item key/ID to attach the summary note to
+        summary: The AI-generated summary text (plain text or HTML)
+        summary_type: Type of summary - "brief" for a short overview,
+                      "detailed" for a comprehensive analysis, or any
+                      custom label (e.g., "methods", "findings", "critique")
+        tags: Additional tags to apply to the note (beyond the automatic
+              "ai-summary" tag). Can be a list or JSON string.
+        ctx: MCP context
+
+    Returns:
+        Confirmation message with the new note key
+    """
+    try:
+        ctx.info(f"Saving AI summary for item {item_key}")
+        zot = get_zotero_client()
+
+        # Parse tags JSON string if needed
+        if tags and isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                return f"Error: tags must be a list of strings or valid JSON string, got: {tags}"
+
+        # Verify the parent item exists
+        try:
+            parent = zot.item(item_key)
+            parent_title = parent["data"].get("title", "Untitled Item")
+        except Exception:
+            return f"Error: No item found with key: {item_key}"
+
+        # Generate timestamp
+        from datetime import datetime, timezone
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        # Build a well-structured HTML note
+        # Convert plain text to HTML if it doesn't already contain HTML tags
+        if "<p>" in summary or "<div>" in summary or "<h" in summary:
+            summary_html = summary
+        else:
+            # Convert markdown-style text to HTML
+            paragraphs = summary.split("\n\n")
+            html_parts = []
+            for p in paragraphs:
+                p_stripped = p.strip()
+                if not p_stripped:
+                    continue
+                # Handle lines that look like headers
+                if p_stripped.startswith("# "):
+                    html_parts.append(f"<h3>{p_stripped[2:]}</h3>")
+                elif p_stripped.startswith("## "):
+                    html_parts.append(f"<h4>{p_stripped[3:]}</h4>")
+                elif p_stripped.startswith("### "):
+                    html_parts.append(f"<h5>{p_stripped[4:]}</h5>")
+                elif p_stripped.startswith("- ") or p_stripped.startswith("* "):
+                    # Handle bullet lists
+                    items = p_stripped.split("\n")
+                    list_items = []
+                    for li in items:
+                        li = li.strip()
+                        if li.startswith("- ") or li.startswith("* "):
+                            list_items.append(f"<li>{li[2:]}</li>")
+                        elif li:
+                            list_items.append(f"<li>{li}</li>")
+                    html_parts.append("<ul>" + "".join(list_items) + "</ul>")
+                else:
+                    p_with_br = p_stripped.replace("\n", "<br/>")
+                    html_parts.append(f"<p>{p_with_br}</p>")
+            summary_html = "".join(html_parts)
+
+        # Build the full note HTML
+        type_label = summary_type.replace("_", " ").title()
+        html_content = (
+            f"<h2>AI Summary ({type_label})</h2>"
+            f"<p><em>Generated: {timestamp}</em></p>"
+            f"<hr/>"
+            f"{summary_html}"
+        )
+
+        # Build tag list — always include "ai-summary" and the summary type
+        note_tags = [{"tag": "ai-summary"}, {"tag": f"ai-summary-{summary_type}"}]
+        if tags:
+            for t in tags:
+                if t not in ["ai-summary", f"ai-summary-{summary_type}"]:
+                    note_tags.append({"tag": t})
+
+        # Prepare the note data
+        note_data = {
+            "itemType": "note",
+            "parentItem": item_key,
+            "note": html_content,
+            "tags": note_tags,
+        }
+
+        # Create the note
+        result = zot.create_items([note_data])
+
+        # Check if creation was successful
+        if "success" in result and result["success"]:
+            successful = result["success"]
+            if successful:
+                note_index = next(iter(successful.keys()))
+                note_key = successful[note_index]
+
+                output = [
+                    "# AI Summary Saved Successfully",
+                    "",
+                    f"**Parent Item:** {parent_title}",
+                    f"**Parent Key:** {item_key}",
+                    f"**Note Key:** {note_key}",
+                    f"**Summary Type:** {type_label}",
+                    f"**Generated:** {timestamp}",
+                    f"**Tags:** {', '.join(t['tag'] for t in note_tags)}",
+                    "",
+                    "The summary has been saved as a note attached to the item.",
+                ]
+                return "\n".join(output)
+            else:
+                return f"Note creation response was successful but no key was returned: {result}"
+        else:
+            return f"Failed to save summary: {result.get('failed', 'Unknown error')}"
+
+    except Exception as e:
+        ctx.error(f"Error saving AI summary: {str(e)}")
+        return f"Error saving AI summary: {str(e)}"
 
 
 @mcp.tool(
