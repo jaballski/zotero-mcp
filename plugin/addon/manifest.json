@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "name": "Zotero Research Assistant",
+  "version": "0.1.0",
+  "description": "Semantic search and AI-powered research assistant for Zotero. NotebookLM-like capabilities built into your reference manager.",
+  "homepage_url": "https://github.com/54yyyu/zotero-mcp",
+  "author": "zotero-mcp contributors",
+  "icons": {
+    "48": "chrome/skin/default/icon48.png",
+    "96": "chrome/skin/default/icon96.png"
+  },
+  "applications": {
+    "zotero": {
+      "id": "zotero-research-assistant@zotero-mcp",
+      "update_url": "https://raw.githubusercontent.com/54yyyu/zotero-mcp/main/plugin/update.json",
+      "strict_min_version": "7.0.0",
+      "strict_max_version": "8.0.*"
+    }
+  }
+}

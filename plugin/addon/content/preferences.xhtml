@@ -1,0 +1,74 @@
+<vbox id="zra-preferences" xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+  xmlns:html="http://www.w3.org/1999/xhtml">
+
+  <groupbox>
+    <label><html:h2>Backend Connection</html:h2></label>
+    <grid>
+      <columns>
+        <column/>
+        <column flex="1"/>
+      </columns>
+      <rows>
+        <row>
+          <label value="Backend Host:"/>
+          <textbox id="zra-pref-host" preference="extensions.zotero-research-assistant.backend.host"/>
+        </row>
+        <row>
+          <label value="Backend Port:"/>
+          <textbox id="zra-pref-port" preference="extensions.zotero-research-assistant.backend.port" type="number"/>
+        </row>
+      </rows>
+    </grid>
+    <description>
+      Start the backend with: zotero-mcp plugin-serve --port 9090
+    </description>
+  </groupbox>
+
+  <groupbox>
+    <label><html:h2>Search Settings</html:h2></label>
+    <hbox align="center">
+      <label value="Default search mode:"/>
+      <menulist id="zra-pref-search-mode" preference="extensions.zotero-research-assistant.search.mode">
+        <menupopup>
+          <menuitem value="hybrid" label="Hybrid (Semantic + Keyword)"/>
+          <menuitem value="semantic" label="Semantic Only"/>
+          <menuitem value="keyword" label="Keyword Only"/>
+        </menupopup>
+      </menulist>
+    </hbox>
+    <hbox align="center">
+      <label value="Max results:"/>
+      <textbox id="zra-pref-max-results" preference="extensions.zotero-research-assistant.search.maxResults" type="number" style="width: 60px"/>
+    </hbox>
+    <checkbox id="zra-pref-auto-index" preference="extensions.zotero-research-assistant.embedding.autoIndex"
+      label="Automatically index new items when added to library"/>
+  </groupbox>
+
+  <groupbox>
+    <label><html:h2>LLM Provider</html:h2></label>
+    <hbox align="center">
+      <label value="Provider:"/>
+      <menulist id="zra-pref-llm-provider" preference="extensions.zotero-research-assistant.llm.provider">
+        <menupopup>
+          <menuitem value="" label="Auto-detect"/>
+          <menuitem value="anthropic" label="Anthropic (Claude)"/>
+          <menuitem value="openai" label="OpenAI (GPT)"/>
+          <menuitem value="google" label="Google (Gemini)"/>
+          <menuitem value="ollama" label="Ollama (Local)"/>
+        </menupopup>
+      </menulist>
+    </hbox>
+    <hbox align="center">
+      <label value="API Key:"/>
+      <textbox id="zra-pref-api-key" preference="extensions.zotero-research-assistant.llm.apiKey" type="password" flex="1"/>
+    </hbox>
+    <hbox align="center">
+      <label value="Model:"/>
+      <textbox id="zra-pref-model" preference="extensions.zotero-research-assistant.llm.model" placeholder="Leave blank for default" flex="1"/>
+    </hbox>
+    <description>
+      API keys can also be set via environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
+    </description>
+  </groupbox>
+
+</vbox>

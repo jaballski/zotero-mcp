@@ -234,6 +234,27 @@ def main():
     # Setup info command
     setup_info_parser = subparsers.add_parser("setup-info", help="Show installation path and configuration info for MCP clients")
 
+    # Plugin API server command
+    plugin_parser = subparsers.add_parser(
+        "plugin-serve",
+        help="Start the HTTP API server for the Zotero Research Assistant plugin"
+    )
+    plugin_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1)",
+    )
+    plugin_parser.add_argument(
+        "--port",
+        type=int,
+        default=9090,
+        help="Port to listen on (default: 9090)",
+    )
+    plugin_parser.add_argument(
+        "--config-path",
+        help="Path to zotero-mcp configuration file",
+    )
+
     args = parser.parse_args()
 
     # If no command is provided, default to 'serve'
@@ -601,6 +622,21 @@ def main():
         except Exception as e:
             print(f"❌ Update error: {e}")
             sys.exit(1)
+
+    elif args.command == "plugin-serve":
+        # Start the HTTP API server for the Zotero Research Assistant plugin
+        setup_zotero_environment()
+
+        from zotero_mcp.plugin_api import run_plugin_api
+
+        host = getattr(args, "host", "127.0.0.1")
+        port = getattr(args, "port", 9090)
+        config_path = getattr(args, "config_path", None)
+
+        if not config_path:
+            config_path = str(Path.home() / ".config" / "zotero-mcp" / "config.json")
+
+        run_plugin_api(host=host, port=port, config_path=config_path)
 
     elif args.command == "serve":
         # Get transport with a default value if not specified

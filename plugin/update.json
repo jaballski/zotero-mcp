@@ -1,0 +1,17 @@
+{
+  "addons": {
+    "zotero-research-assistant@zotero-mcp": {
+      "updates": [
+        {
+          "version": "0.1.0",
+          "update_link": "https://github.com/54yyyu/zotero-mcp/releases/download/plugin-v0.1.0/zotero-research-assistant-0.1.0.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "7.0.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
