@@ -12,10 +12,11 @@ import json
 import logging
 import os
 import sys
+import time
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from threading import Thread
+from threading import Thread, Lock
 from typing import Any
 from urllib.parse import urlparse, parse_qs
 
@@ -24,6 +25,88 @@ from .client import get_zotero_client, format_item_metadata
 from .utils import format_creators
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Shared Indexing State ────────────────────────────────────────
+# Tracks background indexing progress so the plugin UI can poll it.
+
+class IndexingState:
+    """Thread-safe indexing progress tracker."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self._state = "idle"  # idle | indexing | complete | error
+        self._progress = 0  # 0-100
+        self._processed = 0
+        self._total = 0
+        self._message = ""
+        self._error = ""
+        self._last_stats: dict = {}
+        self._started_at: float | None = None
+
+    def start(self, total: int = 0):
+        with self._lock:
+            self._state = "indexing"
+            self._progress = 0
+            self._processed = 0
+            self._total = total
+            self._message = "Starting indexing..."
+            self._error = ""
+            self._last_stats = {}
+            self._started_at = time.time()
+
+    def update(self, processed: int, total: int, message: str = ""):
+        with self._lock:
+            self._processed = processed
+            self._total = total
+            self._progress = int((processed / total) * 100) if total > 0 else 0
+            if message:
+                self._message = message
+
+    def complete(self, stats: dict):
+        with self._lock:
+            self._state = "complete"
+            self._progress = 100
+            self._processed = self._total
+            self._message = "Indexing complete"
+            self._last_stats = stats
+
+    def fail(self, error: str):
+        with self._lock:
+            self._state = "error"
+            self._error = error
+            self._message = f"Indexing failed: {error}"
+
+    def reset(self):
+        with self._lock:
+            self._state = "idle"
+            self._message = ""
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            result = {
+                "state": self._state,
+                "progress": self._progress,
+                "processed": self._processed,
+                "total": self._total,
+                "message": self._message,
+            }
+            if self._error:
+                result["error"] = self._error
+            if self._last_stats:
+                result["last_stats"] = self._last_stats
+            if self._started_at and self._state == "indexing":
+                result["elapsed_seconds"] = int(time.time() - self._started_at)
+            return result
+
+    @property
+    def is_indexing(self) -> bool:
+        with self._lock:
+            return self._state == "indexing"
+
+
+# Global shared instance
+_indexing_state = IndexingState()
 
 
 class PluginAPIHandler(BaseHTTPRequestHandler):
@@ -47,6 +130,8 @@ class PluginAPIHandler(BaseHTTPRequestHandler):
             self._handle_status()
         elif path == "/api/health":
             self._handle_health()
+        elif path == "/api/index/status":
+            self._handle_index_status()
         else:
             self._send_error(404, f"Not found: {path}")
 
@@ -80,16 +165,46 @@ class PluginAPIHandler(BaseHTTPRequestHandler):
         self._send_json({"status": "ok", "version": "0.1.0"})
 
     def _handle_status(self):
-        """Get backend and index status."""
+        """Get backend and index status, including indexing progress."""
         try:
             search = self._get_search()
             status = search.get_database_status()
             status["backend"] = "running"
+            status["indexing"] = _indexing_state.to_dict()
+
+            # Add a clear "ready" flag for the UI
+            collection_info = status.get("collection_info", {})
+            doc_count = collection_info.get("count", 0)
+            status["index_ready"] = doc_count > 0 and not _indexing_state.is_indexing
+            status["document_count"] = doc_count
+
             self._send_json(status)
         except Exception as e:
             self._send_json({
                 "backend": "running",
-                "index": "error",
+                "index_ready": False,
+                "document_count": 0,
+                "indexing": _indexing_state.to_dict(),
+                "error": str(e),
+            })
+
+    def _handle_index_status(self):
+        """Get current indexing progress (lightweight polling endpoint)."""
+        try:
+            search = self._get_search()
+            collection_info = search.chroma_client.get_collection_info()
+            doc_count = collection_info.get("count", 0)
+
+            self._send_json({
+                "document_count": doc_count,
+                "index_ready": doc_count > 0 and not _indexing_state.is_indexing,
+                **_indexing_state.to_dict(),
+            })
+        except Exception as e:
+            self._send_json({
+                "document_count": 0,
+                "index_ready": False,
+                **_indexing_state.to_dict(),
                 "error": str(e),
             })
 
@@ -271,19 +386,93 @@ Please provide a well-structured answer with source citations."""
             self._send_error(500, f"Chat failed: {e}")
 
     def _handle_index_update(self, body: dict):
-        """Trigger index update."""
-        try:
-            search = self._get_search()
-            force = body.get("force_rebuild", False)
-            fulltext = body.get("fulltext", False)
+        """
+        Trigger index update (runs in background thread).
 
-            stats = search.update_database(
-                force_full_rebuild=force, extract_fulltext=fulltext
-            )
-            self._send_json(stats)
-        except Exception as e:
-            logger.error(f"Index update error: {e}")
-            self._send_error(500, f"Index update failed: {e}")
+        Returns immediately with indexing status. Poll /api/index/status for progress.
+
+        Request body:
+            force_rebuild: bool - Force full rebuild (default: false)
+            fulltext: bool - Extract fulltext content (default: false)
+            blocking: bool - If true, wait for completion (default: false)
+        """
+        if _indexing_state.is_indexing:
+            self._send_json({
+                "status": "already_indexing",
+                **_indexing_state.to_dict(),
+            })
+            return
+
+        force = body.get("force_rebuild", False)
+        fulltext = body.get("fulltext", False)
+        blocking = body.get("blocking", False)
+
+        if blocking:
+            # Synchronous mode for CLI/scripts that need to wait
+            try:
+                search = self._get_search()
+                _indexing_state.start()
+                stats = search.update_database(
+                    force_full_rebuild=force, extract_fulltext=fulltext
+                )
+                _indexing_state.complete(stats)
+                self._send_json(stats)
+            except Exception as e:
+                _indexing_state.fail(str(e))
+                self._send_error(500, f"Index update failed: {e}")
+        else:
+            # Background mode (default) - returns immediately
+            def _run_indexing():
+                try:
+                    search = self._get_search()
+                    _indexing_state.start()
+
+                    # Monkey-patch stderr to capture progress from update_database
+                    original_stderr_write = sys.stderr.write
+                    def _progress_interceptor(msg):
+                        original_stderr_write(msg)
+                        # Parse progress messages like "Processed: 10/500 added:5 skipped:3 errors:0"
+                        if "Processed:" in msg or "processed" in msg.lower():
+                            try:
+                                parts = msg.strip().split()
+                                for p in parts:
+                                    if "/" in p and p[0].isdigit():
+                                        nums = p.split("/")
+                                        processed = int(nums[0])
+                                        total = int(nums[1])
+                                        _indexing_state.update(processed, total, msg.strip())
+                                        break
+                            except (ValueError, IndexError):
+                                pass
+                        elif "Total items to index:" in msg:
+                            try:
+                                total = int(msg.split(":")[-1].strip())
+                                _indexing_state.update(0, total, f"Found {total} items to index")
+                            except ValueError:
+                                pass
+                        return len(msg)
+
+                    sys.stderr.write = _progress_interceptor
+                    try:
+                        stats = search.update_database(
+                            force_full_rebuild=force, extract_fulltext=fulltext
+                        )
+                        _indexing_state.complete(stats)
+                    finally:
+                        sys.stderr.write = original_stderr_write
+
+                except Exception as e:
+                    logger.error(f"Background indexing error: {e}\n{traceback.format_exc()}")
+                    _indexing_state.fail(str(e))
+
+            thread = Thread(target=_run_indexing, daemon=True, name="zra-indexing")
+            thread.start()
+
+            self._send_json({
+                "status": "indexing_started",
+                "message": "Index update started in background. Poll /api/index/status for progress.",
+                **_indexing_state.to_dict(),
+            })
 
     def _handle_find_similar(self, body: dict):
         """Find items similar to a given item."""
@@ -630,6 +819,85 @@ Please provide a well-structured answer with source citations."""
         logger.info(format % args)
 
 
+def _auto_index_if_empty(config_path: str | None):
+    """
+    Check if the semantic search index is empty and auto-trigger a build.
+
+    This runs on first startup so users don't have to manually build the index.
+    The indexing runs in a background thread and the server starts immediately.
+    """
+    try:
+        resolved_config = config_path or str(
+            Path.home() / ".config" / "zotero-mcp" / "config.json"
+        )
+
+        search = create_semantic_search(resolved_config)
+        PluginAPIHandler.semantic_search = search
+
+        # Check document count
+        collection_info = search.chroma_client.get_collection_info()
+        doc_count = collection_info.get("count", 0)
+
+        if doc_count == 0:
+            sys.stderr.write("\n=== First Run Detected ===\n")
+            sys.stderr.write("Semantic search index is empty. Building embeddings in background...\n")
+            sys.stderr.write("This may take a few minutes depending on library size.\n")
+            sys.stderr.write("Search will work (in keyword mode) while indexing completes.\n\n")
+
+            def _background_first_index():
+                try:
+                    _indexing_state.start()
+                    _indexing_state.update(0, 0, "Fetching library items...")
+
+                    original_stderr_write = sys.stderr.write
+                    def _progress_interceptor(msg):
+                        original_stderr_write(msg)
+                        if "Processed:" in msg or "processed" in msg.lower():
+                            try:
+                                parts = msg.strip().split()
+                                for p in parts:
+                                    if "/" in p and p[0].isdigit():
+                                        nums = p.split("/")
+                                        processed = int(nums[0])
+                                        total = int(nums[1])
+                                        _indexing_state.update(processed, total, msg.strip())
+                                        break
+                            except (ValueError, IndexError):
+                                pass
+                        elif "Total items to index:" in msg:
+                            try:
+                                total = int(msg.split(":")[-1].strip())
+                                _indexing_state.update(0, total, f"Found {total} items to index")
+                            except ValueError:
+                                pass
+                        return len(msg)
+
+                    sys.stderr.write = _progress_interceptor
+                    try:
+                        stats = search.update_database(extract_fulltext=False)
+                        _indexing_state.complete(stats)
+                        original_stderr_write(
+                            f"\n=== Indexing Complete ===\n"
+                            f"Indexed {stats.get('processed_items', 0)} items "
+                            f"in {stats.get('duration', 'unknown')}.\n"
+                            f"Semantic search is now ready!\n\n"
+                        )
+                    finally:
+                        sys.stderr.write = original_stderr_write
+
+                except Exception as e:
+                    _indexing_state.fail(str(e))
+                    sys.stderr.write(f"Auto-indexing failed: {e}\n")
+
+            thread = Thread(target=_background_first_index, daemon=True, name="zra-first-index")
+            thread.start()
+        else:
+            sys.stderr.write(f"Semantic search index: {doc_count} documents indexed\n")
+
+    except Exception as e:
+        sys.stderr.write(f"Warning: Could not check index status: {e}\n")
+
+
 def start_plugin_api(
     host: str = "127.0.0.1",
     port: int = 9090,
@@ -652,13 +920,17 @@ def start_plugin_api(
     logger.info(f"Plugin API server starting on {host}:{port}")
     sys.stderr.write(f"Plugin API server running on http://{host}:{port}\n")
     sys.stderr.write(f"Endpoints:\n")
-    sys.stderr.write(f"  GET  /api/health       - Health check\n")
-    sys.stderr.write(f"  GET  /api/status       - Index status\n")
-    sys.stderr.write(f"  POST /api/search       - Semantic/hybrid search\n")
-    sys.stderr.write(f"  POST /api/chat         - AI research assistant\n")
-    sys.stderr.write(f"  POST /api/index/update  - Update search index\n")
-    sys.stderr.write(f"  POST /api/similar      - Find similar items\n")
-    sys.stderr.write(f"  POST /api/summarize    - Summarize items\n")
+    sys.stderr.write(f"  GET  /api/health        - Health check\n")
+    sys.stderr.write(f"  GET  /api/status        - Full status + index info\n")
+    sys.stderr.write(f"  GET  /api/index/status   - Indexing progress (poll this)\n")
+    sys.stderr.write(f"  POST /api/search        - Semantic/hybrid search\n")
+    sys.stderr.write(f"  POST /api/chat          - AI research assistant\n")
+    sys.stderr.write(f"  POST /api/index/update   - Trigger index update\n")
+    sys.stderr.write(f"  POST /api/similar       - Find similar items\n")
+    sys.stderr.write(f"  POST /api/summarize     - Summarize items\n")
+
+    # Auto-build index if empty (runs in background, doesn't block server start)
+    _auto_index_if_empty(config_path)
 
     return server
 

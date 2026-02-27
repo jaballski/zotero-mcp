@@ -221,6 +221,22 @@ Zotero.ZoteroResearchAssistant = {
       },
     });
 
+    // ─── /zra/index/status (GET - lightweight polling) ───────
+    this._registerEndpoint("/zra/index/status", {
+      supportedMethods: ["GET"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const resp = await fetch(`${self._getBackendURL()}/api/index/status`);
+          const body = await resp.json();
+          sendResponseCallback(200, "application/json", JSON.stringify(body));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message, state: "backend_unavailable" }));
+        }
+      },
+    });
+
     Zotero.debug(`[ZRA] Registered ${this._registeredEndpoints.length} HTTP endpoints`);
   },
 
@@ -449,17 +465,152 @@ Zotero.ZoteroResearchAssistant = {
     // 4. Add context menu items
     this._addContextMenu(doc);
 
+    // 5. Start polling for indexing status
+    this._startIndexStatusPolling(doc);
+
     Zotero.debug("[ZRA] UI elements added to window");
   },
 
   _removeUI(window) {
     const doc = window.document;
+
+    // Stop polling
+    if (this._indexPollTimer) {
+      clearInterval(this._indexPollTimer);
+      this._indexPollTimer = null;
+    }
+
     // Remove all elements we added (identified by class)
     const elements = doc.querySelectorAll(".zra-element");
     for (const el of elements) {
       el.remove();
     }
     Zotero.debug("[ZRA] UI elements removed from window");
+  },
+
+  // ─── Index Status Polling & Progress UI ─────────────────────
+
+  _indexPollTimer: null,
+
+  _startIndexStatusPolling(doc) {
+    // Poll immediately, then every 3 seconds while indexing, every 30s otherwise
+    this._pollIndexStatus(doc);
+
+    this._indexPollTimer = setInterval(() => {
+      this._pollIndexStatus(doc);
+    }, 3000);
+  },
+
+  async _pollIndexStatus(doc) {
+    try {
+      const resp = await fetch(`${this._getBackendURL()}/api/index/status`);
+      if (!resp.ok) return;
+
+      const status = await resp.json();
+      this._updateIndexUI(doc, status);
+
+      // Slow down polling when not indexing
+      if (status.state !== "indexing" && this._indexPollTimer) {
+        clearInterval(this._indexPollTimer);
+        this._indexPollTimer = setInterval(() => {
+          this._pollIndexStatus(doc);
+        }, 30000);
+      }
+      // Speed up polling when indexing
+      if (status.state === "indexing" && this._indexPollTimer) {
+        clearInterval(this._indexPollTimer);
+        this._indexPollTimer = setInterval(() => {
+          this._pollIndexStatus(doc);
+        }, 2000);
+      }
+    } catch {
+      // Backend not ready yet - update UI to show that
+      this._updateIndexUI(doc, {
+        state: "backend_unavailable",
+        document_count: 0,
+        index_ready: false,
+        message: "Waiting for backend to start...",
+      });
+    }
+  },
+
+  _updateIndexUI(doc, status) {
+    const banner = doc.getElementById("zra-index-banner");
+    const progressBar = doc.getElementById("zra-index-progress");
+    const progressLabel = doc.getElementById("zra-index-progress-label");
+    const statusLabel = doc.getElementById("zra-search-status-label");
+    const indexBtn = doc.getElementById("zra-index-btn");
+
+    if (!banner) return;
+
+    const state = status.state || "idle";
+    const docCount = status.document_count || 0;
+    const progress = status.progress || 0;
+    const message = status.message || "";
+
+    if (state === "indexing") {
+      // Show progress banner
+      banner.hidden = false;
+      banner.style.backgroundColor = "var(--color-accent10, #e3f2fd)";
+      banner.style.borderColor = "var(--color-accent, #1976d2)";
+
+      if (progressBar) {
+        progressBar.hidden = false;
+        progressBar.value = progress;
+        progressBar.max = 100;
+      }
+
+      const displayMsg = status.total > 0
+        ? `Indexing: ${status.processed}/${status.total} items (${progress}%)`
+        : message || "Building search index...";
+
+      if (progressLabel) progressLabel.setAttribute("value", displayMsg);
+      if (statusLabel) statusLabel.setAttribute("value", displayMsg);
+      if (indexBtn) indexBtn.disabled = true;
+
+    } else if (state === "complete" && docCount > 0) {
+      // Index is ready
+      banner.hidden = true;
+      if (progressBar) progressBar.hidden = true;
+      if (statusLabel) {
+        statusLabel.setAttribute("value", `Index ready: ${docCount} items`);
+      }
+      if (indexBtn) indexBtn.disabled = false;
+
+    } else if (state === "error") {
+      banner.hidden = false;
+      banner.style.backgroundColor = "var(--accent-red10, #fce4ec)";
+      banner.style.borderColor = "var(--accent-red, #d32f2f)";
+      if (progressBar) progressBar.hidden = true;
+      if (progressLabel) {
+        progressLabel.setAttribute("value", `Indexing error: ${status.error || "unknown"}`);
+      }
+      if (indexBtn) indexBtn.disabled = false;
+
+    } else if (docCount === 0 && state !== "indexing") {
+      // Empty index - show banner prompting to build
+      banner.hidden = false;
+      banner.style.backgroundColor = "var(--color-accent10, #fff3e0)";
+      banner.style.borderColor = "var(--color-accent, #f57c00)";
+      if (progressBar) progressBar.hidden = true;
+      if (progressLabel) {
+        progressLabel.setAttribute("value",
+          state === "backend_unavailable"
+            ? "Starting backend..."
+            : "No search index yet. Click 'Update Index' or wait for auto-build."
+        );
+      }
+      if (indexBtn) indexBtn.disabled = state === "backend_unavailable";
+
+    } else {
+      // Normal idle state with populated index
+      banner.hidden = true;
+      if (progressBar) progressBar.hidden = true;
+      if (statusLabel) {
+        statusLabel.setAttribute("value", `Ready (${docCount} items indexed)`);
+      }
+      if (indexBtn) indexBtn.disabled = false;
+    }
   },
 
   // ─── Semantic Search Panel ─────────────────────────────────
@@ -509,6 +660,37 @@ Zotero.ZoteroResearchAssistant = {
     header.appendChild(modeMenu);
 
     panel.appendChild(header);
+
+    // Index status banner (shown when index is empty or building)
+    const indexBanner = doc.createXULElement("vbox");
+    indexBanner.id = "zra-index-banner";
+    indexBanner.hidden = true; // Hidden by default, shown by _updateIndexUI
+    indexBanner.style.padding = "8px 10px";
+    indexBanner.style.margin = "4px";
+    indexBanner.style.borderRadius = "6px";
+    indexBanner.style.border = "1px solid var(--color-accent, #1976d2)";
+    indexBanner.style.backgroundColor = "var(--color-accent10, #e3f2fd)";
+    indexBanner.style.fontSize = "12px";
+
+    const progressLabel = doc.createXULElement("label");
+    progressLabel.id = "zra-index-progress-label";
+    progressLabel.setAttribute("value", "Checking index status...");
+    progressLabel.style.fontWeight = "500";
+    indexBanner.appendChild(progressLabel);
+
+    // Progress bar
+    const progressBar = doc.createXULElement("html:progress");
+    progressBar.id = "zra-index-progress";
+    progressBar.hidden = true;
+    progressBar.setAttribute("max", "100");
+    progressBar.setAttribute("value", "0");
+    progressBar.style.width = "100%";
+    progressBar.style.height = "6px";
+    progressBar.style.marginTop = "6px";
+    progressBar.style.borderRadius = "3px";
+    indexBanner.appendChild(progressBar);
+
+    panel.appendChild(indexBanner);
 
     // Search results container
     const results = doc.createXULElement("vbox");
