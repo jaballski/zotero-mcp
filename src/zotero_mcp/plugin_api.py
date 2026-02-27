@@ -151,6 +151,8 @@ class PluginAPIHandler(BaseHTTPRequestHandler):
             self._handle_chat(body)
         elif path == "/api/index/update":
             self._handle_index_update(body)
+        elif path == "/api/index/items":
+            self._handle_index_items(body)
         elif path == "/api/similar":
             self._handle_find_similar(body)
         elif path == "/api/summarize":
@@ -473,6 +475,36 @@ Please provide a well-structured answer with source citations."""
                 "message": "Index update started in background. Poll /api/index/status for progress.",
                 **_indexing_state.to_dict(),
             })
+
+    def _handle_index_items(self, body: dict):
+        """
+        Index specific items by their Zotero keys (incremental indexing).
+
+        Much faster than /api/index/update for small numbers of items (e.g.,
+        when a user adds 1-5 new papers). Only fetches and processes the
+        specified items instead of scanning the entire library.
+
+        Request body:
+            item_keys: list[str] - Zotero item keys to index (required)
+            fulltext: bool - Extract fulltext from PDFs (default: true)
+        """
+        item_keys = body.get("item_keys", [])
+        if not item_keys or not isinstance(item_keys, list):
+            self._send_error(400, "item_keys is required (list of Zotero item keys)")
+            return
+
+        fulltext = body.get("fulltext", True)
+
+        try:
+            search = self._get_search()
+            stats = search.index_items(item_keys, extract_fulltext=fulltext)
+            self._send_json({
+                "status": "ok",
+                **stats,
+            })
+        except Exception as e:
+            logger.error(f"Incremental indexing error: {e}\n{traceback.format_exc()}")
+            self._send_error(500, f"Incremental indexing failed: {e}")
 
     def _handle_find_similar(self, body: dict):
         """Find items similar to a given item."""

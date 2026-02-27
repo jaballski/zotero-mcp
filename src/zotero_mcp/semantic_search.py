@@ -644,6 +644,111 @@ class ZoteroSemanticSearch:
             stats["duration"] = str(end_time - start_time)
             return stats
 
+    def index_items(self, item_keys: list[str], extract_fulltext: bool = True) -> dict[str, Any]:
+        """
+        Index specific items by their Zotero keys (incremental indexing).
+
+        Much faster than update_database() for small numbers of items since it
+        only fetches and processes the specified items instead of scanning the
+        entire library.
+
+        Args:
+            item_keys: List of Zotero item keys to index.
+            extract_fulltext: Whether to extract fulltext from PDFs/attachments.
+
+        Returns:
+            Indexing statistics.
+        """
+        logger.info(f"Incremental indexing {len(item_keys)} items: {item_keys}")
+        start_time = datetime.now()
+
+        stats = {
+            "total_items": len(item_keys),
+            "processed_items": 0,
+            "added_items": 0,
+            "updated_items": 0,
+            "skipped_items": 0,
+            "errors": 0,
+            "start_time": start_time.isoformat(),
+            "incremental": True,
+        }
+
+        try:
+            # Try local DB first (faster, supports fulltext)
+            api_items = []
+            if is_local_mode():
+                try:
+                    from .local_db import LocalZoteroReader
+                    pdf_max_pages = None
+                    zotero_db_path = self.db_path
+                    if self.config_path and os.path.exists(self.config_path):
+                        try:
+                            with open(self.config_path) as _f:
+                                _cfg = json.load(_f)
+                                pdf_max_pages = _cfg.get("semantic_search", {}).get("extraction", {}).get("pdf_max_pages")
+                                if not zotero_db_path:
+                                    zotero_db_path = _cfg.get("semantic_search", {}).get("zotero_db_path")
+                        except Exception:
+                            pass
+
+                    with suppress_stdout(), LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages) as reader:
+                        local_items = reader.get_items_by_keys(item_keys, include_fulltext=extract_fulltext)
+                        for item in local_items:
+                            api_item = {
+                                "key": item.key,
+                                "version": 0,
+                                "data": {
+                                    "key": item.key,
+                                    "itemType": item.item_type or "journalArticle",
+                                    "title": item.title or "",
+                                    "abstractNote": item.abstract or "",
+                                    "extra": item.extra or "",
+                                    "fulltext": item.fulltext or "",
+                                    "fulltextSource": item.fulltext_source or "",
+                                    "dateAdded": item.date_added,
+                                    "dateModified": item.date_modified,
+                                    "creators": self._parse_creators_string(item.creators) if item.creators else [],
+                                }
+                            }
+                            if item.notes:
+                                api_item["data"]["notes"] = item.notes
+                            api_items.append(api_item)
+                except Exception as e:
+                    logger.warning(f"Local DB fetch failed, falling back to API: {e}")
+
+            # Fallback to Zotero API for any keys not found locally
+            found_keys = {it["key"] for it in api_items}
+            missing_keys = [k for k in item_keys if k not in found_keys]
+            if missing_keys:
+                for key in missing_keys:
+                    try:
+                        item = self.zotero_client.item(key)
+                        if item and item.get("data", {}).get("itemType") not in ("attachment", "note"):
+                            api_items.append(item)
+                    except Exception as e:
+                        logger.error(f"Error fetching item {key} from API: {e}")
+                        stats["errors"] += 1
+
+            # Process the items
+            if api_items:
+                batch_stats = self._process_item_batch(api_items)
+                stats["processed_items"] = batch_stats["processed"]
+                stats["added_items"] = batch_stats["added"]
+                stats["updated_items"] = batch_stats["updated"]
+                stats["skipped_items"] = batch_stats["skipped"]
+                stats["errors"] += batch_stats["errors"]
+
+            end_time = datetime.now()
+            stats["duration"] = str(end_time - start_time)
+            logger.info(f"Incremental indexing completed in {stats['duration']}: {stats['added_items']} added, {stats['errors']} errors")
+            return stats
+
+        except Exception as e:
+            logger.error(f"Error in incremental indexing: {e}")
+            stats["error"] = str(e)
+            stats["duration"] = str(datetime.now() - start_time)
+            return stats
+
     def _process_item_batch(self, items: list[dict[str, Any]], force_rebuild: bool = False) -> dict[str, int]:
         """Process a batch of items."""
         stats = {"processed": 0, "added": 0, "updated": 0, "skipped": 0, "errors": 0}

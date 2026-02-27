@@ -130,6 +130,7 @@ Zotero.ZoteroResearchAssistant = {
               "POST /zra/search",
               "POST /zra/chat",
               "POST /zra/index/update",
+              "POST /zra/index/items",
               "POST /zra/similar",
               "POST /zra/summarize",
             ],
@@ -181,6 +182,22 @@ Zotero.ZoteroResearchAssistant = {
         try {
           const body = typeof data === "string" ? JSON.parse(data) : data;
           const resp = await self._proxyToBackend("/api/index/update", body);
+          sendResponseCallback(200, "application/json", JSON.stringify(resp));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    // ─── /zra/index/items (incremental indexing) ──────────────
+    this._registerEndpoint("/zra/index/items", {
+      supportedMethods: ["POST"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const body = typeof data === "string" ? JSON.parse(data) : data;
+          const resp = await self._proxyToBackend("/api/index/items", body);
           sendResponseCallback(200, "application/json", JSON.stringify(resp));
         } catch (e) {
           sendResponseCallback(500, "application/json",
@@ -1296,6 +1313,8 @@ Zotero.ZoteroResearchAssistant = {
 
   // ─── Notifier Observer ─────────────────────────────────────
 
+  _pendingIndexKeys: [],
+
   _notifierObserver: {
     notify(event, type, ids) {
       if (type === "item" && (event === "add" || event === "modify")) {
@@ -1304,22 +1323,54 @@ Zotero.ZoteroResearchAssistant = {
           "embedding.autoIndex",
           true
         );
-        if (autoIndex) {
-          Zotero.debug(
-            `[ZRA] Items ${event}: ${ids.join(", ")} - queuing for indexing`
-          );
-          // Debounce: wait a bit for batch adds
-          if (Zotero.ZoteroResearchAssistant._indexTimeout) {
-            clearTimeout(Zotero.ZoteroResearchAssistant._indexTimeout);
+        if (!autoIndex) return;
+
+        // Resolve Zotero numeric IDs to item keys, filtering out attachments/notes
+        const zra = Zotero.ZoteroResearchAssistant;
+        const itemKeys = [];
+        for (const id of ids) {
+          try {
+            const item = Zotero.Items.get(id);
+            if (
+              item &&
+              !item.isAttachment() &&
+              !item.isNote() &&
+              !item.isAnnotation()
+            ) {
+              itemKeys.push(item.key);
+            }
+          } catch (e) {
+            // ID might not be valid, skip
           }
-          Zotero.ZoteroResearchAssistant._indexTimeout = setTimeout(() => {
-            Zotero.ZoteroResearchAssistant._backend
-              .updateIndex()
-              .catch((e) =>
-                Zotero.debug(`[ZRA] Auto-index error: ${e.message}`)
-              );
-          }, 5000);
         }
+
+        if (itemKeys.length === 0) return;
+
+        Zotero.debug(
+          `[ZRA] Items ${event}: ${itemKeys.join(", ")} - queuing for incremental indexing`
+        );
+
+        // Accumulate keys and debounce to batch rapid adds
+        zra._pendingIndexKeys.push(...itemKeys);
+
+        if (zra._indexTimeout) {
+          clearTimeout(zra._indexTimeout);
+        }
+        zra._indexTimeout = setTimeout(() => {
+          // Deduplicate accumulated keys
+          const uniqueKeys = [...new Set(zra._pendingIndexKeys)];
+          zra._pendingIndexKeys = [];
+
+          Zotero.debug(
+            `[ZRA] Incremental indexing ${uniqueKeys.length} items: ${uniqueKeys.join(", ")}`
+          );
+
+          zra._backend
+            .indexItems(uniqueKeys)
+            .catch((e) =>
+              Zotero.debug(`[ZRA] Auto-index error: ${e.message}`)
+            );
+        }, 5000);
       }
     },
   },
@@ -1402,6 +1453,14 @@ class ZRABackendClient {
     const response = await this._request("/api/index/update", {
       method: "POST",
       body: JSON.stringify(options),
+    });
+    return response;
+  }
+
+  async indexItems(itemKeys, options = {}) {
+    const response = await this._request("/api/index/items", {
+      method: "POST",
+      body: JSON.stringify({ item_keys: itemKeys, ...options }),
     });
     return response;
   }
