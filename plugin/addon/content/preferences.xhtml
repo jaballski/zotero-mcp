@@ -3,6 +3,8 @@
 
   <groupbox>
     <label><html:h2>Backend Connection</html:h2></label>
+    <checkbox id="zra-pref-auto-start" preference="extensions.zotero-research-assistant.backend.autoStart"
+      label="Auto-start backend when Zotero opens (recommended)"/>
     <grid>
       <columns>
         <column/>
@@ -17,10 +19,17 @@
           <label value="Backend Port:"/>
           <textbox id="zra-pref-port" preference="extensions.zotero-research-assistant.backend.port" type="number"/>
         </row>
+        <row>
+          <label value="Command path:"/>
+          <textbox id="zra-pref-command" preference="extensions.zotero-research-assistant.backend.command"
+            placeholder="Leave blank for auto-detect (zotero-mcp)" flex="1"/>
+        </row>
       </rows>
     </grid>
     <description>
-      Start the backend with: zotero-mcp plugin-serve --port 9090
+      The backend auto-starts when Zotero opens. HTTP endpoints are available at
+      http://127.0.0.1:23119/zra/... (Zotero's built-in server) when Zotero is running.
+      Install the backend with: pip install zotero-mcp
     </description>
   </groupbox>
 

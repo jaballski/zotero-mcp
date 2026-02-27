@@ -1,6 +1,8 @@
 // Default preferences for Zotero Research Assistant
 pref("extensions.zotero-research-assistant.backend.host", "http://127.0.0.1");
 pref("extensions.zotero-research-assistant.backend.port", 9090);
+pref("extensions.zotero-research-assistant.backend.autoStart", true);
+pref("extensions.zotero-research-assistant.backend.command", "");
 pref("extensions.zotero-research-assistant.search.mode", "hybrid");
 pref("extensions.zotero-research-assistant.search.maxResults", 20);
 pref("extensions.zotero-research-assistant.embedding.model", "default");

@@ -5,6 +5,13 @@
  *
  * Provides semantic search and AI-powered research assistant capabilities
  * within Zotero, communicating with a local Python backend (zotero-mcp).
+ *
+ * Architecture:
+ *   1. Registers HTTP endpoints on Zotero's built-in connector server (port 23119)
+ *      so external tools (MCP clients, scripts) can access search/chat when Zotero is open
+ *   2. Auto-spawns the Python backend (zotero-mcp plugin-serve) as a child process
+ *      on plugin startup, kills it on shutdown - no manual server management needed
+ *   3. Plugin UI talks to the Python backend via localhost HTTP
  */
 Zotero.ZoteroResearchAssistant = {
   rootURI: null,
@@ -13,6 +20,9 @@ Zotero.ZoteroResearchAssistant = {
   _notifierID: null,
   _windows: new Set(),
   _backend: null,
+  _backendProcess: null,
+  _backendPort: 9090,
+  _registeredEndpoints: [],
 
   // ─── Lifecycle ──────────────────────────────────────────────
 
@@ -23,10 +33,18 @@ Zotero.ZoteroResearchAssistant = {
 
     Zotero.debug("[ZRA] Initializing Research Assistant v" + version);
 
-    // Initialize backend client
+    this._backendPort = this._getPref("backend.port", 9090);
+
+    // 1. Register HTTP endpoints on Zotero's built-in server (port 23119)
+    this._registerHTTPEndpoints();
+
+    // 2. Auto-start the Python backend process
+    await this._startBackendProcess();
+
+    // 3. Initialize the backend HTTP client (talks to our Python process)
     this._backend = new ZRABackendClient(this._getBackendURL());
 
-    // Register notifier to watch for library changes
+    // 4. Register notifier to watch for library changes
     this._notifierID = Zotero.Notifier.registerObserver(
       this._notifierObserver,
       ["item"],
@@ -50,6 +68,12 @@ Zotero.ZoteroResearchAssistant = {
   shutdown() {
     Zotero.debug("[ZRA] Shutting down");
 
+    // Stop the Python backend process
+    this._stopBackendProcess();
+
+    // Unregister HTTP endpoints
+    this._unregisterHTTPEndpoints();
+
     // Unregister notifier
     if (this._notifierID) {
       Zotero.Notifier.unregisterObserver(this._notifierID);
@@ -62,6 +86,350 @@ Zotero.ZoteroResearchAssistant = {
     }
     this._windows.clear();
     this._initialized = false;
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // HTTP ENDPOINTS ON ZOTERO'S BUILT-IN SERVER (port 23119)
+  //
+  // These endpoints are available whenever Zotero is running.
+  // External tools can call:
+  //   http://127.0.0.1:23119/zra/status
+  //   http://127.0.0.1:23119/zra/search  (POST)
+  //   http://127.0.0.1:23119/zra/chat    (POST)
+  //   etc.
+  // ═══════════════════════════════════════════════════════════════
+
+  _registerHTTPEndpoints() {
+    Zotero.debug("[ZRA] Registering HTTP endpoints on Zotero connector server");
+
+    const self = this;
+
+    // ─── /zra/status ─────────────────────────────────────────
+    this._registerEndpoint("/zra/status", {
+      supportedMethods: ["GET"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const backendURL = self._getBackendURL();
+          let backendStatus = "unknown";
+          try {
+            const resp = await fetch(`${backendURL}/api/health`);
+            if (resp.ok) backendStatus = "running";
+            else backendStatus = "error";
+          } catch {
+            backendStatus = "not_running";
+          }
+
+          sendResponseCallback(200, "application/json", JSON.stringify({
+            plugin_version: self.version,
+            backend_status: backendStatus,
+            backend_url: backendURL,
+            backend_pid: self._backendProcess ? "running" : null,
+            endpoints: [
+              "GET  /zra/status",
+              "POST /zra/search",
+              "POST /zra/chat",
+              "POST /zra/index/update",
+              "POST /zra/similar",
+              "POST /zra/summarize",
+            ],
+          }));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    // ─── /zra/search ─────────────────────────────────────────
+    this._registerEndpoint("/zra/search", {
+      supportedMethods: ["POST"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const body = typeof data === "string" ? JSON.parse(data) : data;
+          const resp = await self._proxyToBackend("/api/search", body);
+          sendResponseCallback(200, "application/json", JSON.stringify(resp));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    // ─── /zra/chat ───────────────────────────────────────────
+    this._registerEndpoint("/zra/chat", {
+      supportedMethods: ["POST"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const body = typeof data === "string" ? JSON.parse(data) : data;
+          const resp = await self._proxyToBackend("/api/chat", body);
+          sendResponseCallback(200, "application/json", JSON.stringify(resp));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    // ─── /zra/index/update ───────────────────────────────────
+    this._registerEndpoint("/zra/index/update", {
+      supportedMethods: ["POST"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const body = typeof data === "string" ? JSON.parse(data) : data;
+          const resp = await self._proxyToBackend("/api/index/update", body);
+          sendResponseCallback(200, "application/json", JSON.stringify(resp));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    // ─── /zra/similar ────────────────────────────────────────
+    this._registerEndpoint("/zra/similar", {
+      supportedMethods: ["POST"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const body = typeof data === "string" ? JSON.parse(data) : data;
+          const resp = await self._proxyToBackend("/api/similar", body);
+          sendResponseCallback(200, "application/json", JSON.stringify(resp));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    // ─── /zra/summarize ──────────────────────────────────────
+    this._registerEndpoint("/zra/summarize", {
+      supportedMethods: ["POST"],
+      supportedDataTypes: ["application/json"],
+      async init(data, sendResponseCallback) {
+        try {
+          const body = typeof data === "string" ? JSON.parse(data) : data;
+          const resp = await self._proxyToBackend("/api/summarize", body);
+          sendResponseCallback(200, "application/json", JSON.stringify(resp));
+        } catch (e) {
+          sendResponseCallback(500, "application/json",
+            JSON.stringify({ error: e.message }));
+        }
+      },
+    });
+
+    Zotero.debug(`[ZRA] Registered ${this._registeredEndpoints.length} HTTP endpoints`);
+  },
+
+  _registerEndpoint(path, handler) {
+    // Zotero's server endpoint registration pattern:
+    // Zotero.Server.Endpoints[path] = constructor; prototype has init() etc.
+    const EndpointConstructor = function () {};
+    EndpointConstructor.prototype = handler;
+    Zotero.Server.Endpoints[path] = EndpointConstructor;
+    this._registeredEndpoints.push(path);
+    Zotero.debug(`[ZRA] Registered endpoint: ${path}`);
+  },
+
+  _unregisterHTTPEndpoints() {
+    for (const path of this._registeredEndpoints) {
+      delete Zotero.Server.Endpoints[path];
+      Zotero.debug(`[ZRA] Unregistered endpoint: ${path}`);
+    }
+    this._registeredEndpoints = [];
+  },
+
+  async _proxyToBackend(apiPath, body) {
+    const url = `${this._getBackendURL()}${apiPath}`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Backend error (${response.status}): ${text}`);
+    }
+
+    return await response.json();
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // PYTHON BACKEND PROCESS MANAGEMENT
+  //
+  // Auto-starts `zotero-mcp plugin-serve` when the plugin loads,
+  // auto-kills it when the plugin shuts down or Zotero closes.
+  // ═══════════════════════════════════════════════════════════════
+
+  async _startBackendProcess() {
+    if (!this._getPref("backend.autoStart", true)) {
+      Zotero.debug("[ZRA] Backend auto-start disabled in preferences");
+      return;
+    }
+
+    const port = this._backendPort;
+
+    // Check if backend is already running (maybe from a previous session or manual start)
+    try {
+      const resp = await fetch(`http://127.0.0.1:${port}/api/health`);
+      if (resp.ok) {
+        Zotero.debug(`[ZRA] Backend already running on port ${port}`);
+        return;
+      }
+    } catch {
+      // Not running - we'll start it
+    }
+
+    Zotero.debug("[ZRA] Starting Python backend process...");
+
+    try {
+      // Find the zotero-mcp executable
+      const command = this._findBackendCommand();
+      if (!command) {
+        Zotero.debug("[ZRA] Could not find zotero-mcp command. Backend not started.");
+        Zotero.debug("[ZRA] Install it with: pip install zotero-mcp");
+        return;
+      }
+
+      // Use nsIProcess to spawn the backend
+      const file = Components.classes["@mozilla.org/file/local;1"]
+        .createInstance(Components.interfaces.nsIFile);
+
+      // Determine the executable and arguments
+      const isWindows = Services.appinfo.OS === "WINNT";
+      let executable;
+      let args;
+
+      if (command.startsWith("/") || command.includes("\\")) {
+        // Direct path to executable
+        file.initWithPath(command);
+        executable = file;
+        args = ["plugin-serve", "--port", String(port)];
+      } else {
+        // Use shell to resolve command from PATH
+        if (isWindows) {
+          file.initWithPath("C:\\Windows\\System32\\cmd.exe");
+          executable = file;
+          args = ["/c", command, "plugin-serve", "--port", String(port)];
+        } else {
+          file.initWithPath("/bin/sh");
+          executable = file;
+          args = ["-c", `${command} plugin-serve --port ${port}`];
+        }
+      }
+
+      const process = Components.classes["@mozilla.org/process/util;1"]
+        .createInstance(Components.interfaces.nsIProcess);
+      process.init(executable);
+
+      // Run non-blocking (background process)
+      process.runAsync(args, args.length);
+
+      this._backendProcess = process;
+      Zotero.debug(`[ZRA] Backend process started (port ${port})`);
+
+      // Wait briefly, then verify it's running
+      await new Promise((resolve) =>
+        Zotero.setTimeout(resolve, 2000)
+      );
+
+      try {
+        const healthResp = await fetch(`http://127.0.0.1:${port}/api/health`);
+        if (healthResp.ok) {
+          Zotero.debug("[ZRA] Backend is healthy and responding");
+        } else {
+          Zotero.debug("[ZRA] Backend started but health check returned non-200");
+        }
+      } catch {
+        Zotero.debug("[ZRA] Backend started but not yet responding. It may need more time to initialize.");
+      }
+    } catch (e) {
+      Zotero.debug(`[ZRA] Failed to start backend: ${e.message}`);
+      Zotero.debug("[ZRA] You can start it manually with: zotero-mcp plugin-serve --port " + port);
+    }
+  },
+
+  _stopBackendProcess() {
+    if (!this._backendProcess) return;
+
+    Zotero.debug("[ZRA] Stopping backend process...");
+    try {
+      // Try graceful shutdown via HTTP
+      fetch(`${this._getBackendURL()}/api/shutdown`, { method: "POST" }).catch(() => {});
+
+      // Kill the process if it's still running
+      if (this._backendProcess.isRunning) {
+        this._backendProcess.kill();
+        Zotero.debug("[ZRA] Backend process killed");
+      }
+    } catch (e) {
+      Zotero.debug(`[ZRA] Error stopping backend: ${e.message}`);
+    }
+    this._backendProcess = null;
+  },
+
+  _findBackendCommand() {
+    // Strategy: try multiple ways to find zotero-mcp
+    const isWindows = Services.appinfo.OS === "WINNT";
+
+    // 1. Check preference for custom path
+    const customPath = this._getPref("backend.command", "");
+    if (customPath) return customPath;
+
+    // 2. Try common locations
+    const candidates = isWindows
+      ? [
+          "zotero-mcp",
+          "zotero-mcp.exe",
+        ]
+      : [
+          "zotero-mcp",
+          "/usr/local/bin/zotero-mcp",
+          "/usr/bin/zotero-mcp",
+        ];
+
+    // For non-Windows, also check common Python environment locations
+    if (!isWindows) {
+      const home = Components.classes["@mozilla.org/file/directory_service;1"]
+        .getService(Components.interfaces.nsIProperties)
+        .get("Home", Components.interfaces.nsIFile).path;
+
+      candidates.push(
+        `${home}/.local/bin/zotero-mcp`,
+        `${home}/.cargo/bin/zotero-mcp`, // uvx
+      );
+
+      // Also try using python -m
+      candidates.push("python3 -m zotero_mcp.cli");
+      candidates.push("python -m zotero_mcp.cli");
+    }
+
+    // Try to verify each candidate exists
+    for (const candidate of candidates) {
+      try {
+        if (candidate.includes(" ")) {
+          // It's a compound command (e.g., "python3 -m zotero_mcp.cli")
+          // We'll use it through the shell, just return it
+          return candidate;
+        }
+
+        const file = Components.classes["@mozilla.org/file/local;1"]
+          .createInstance(Components.interfaces.nsIFile);
+        file.initWithPath(candidate);
+        if (file.exists() && file.isExecutable()) {
+          return candidate;
+        }
+      } catch {
+        // Path may not be absolute or file doesn't exist, try next
+      }
+    }
+
+    // Fallback: just use the name and let the shell resolve it
+    return "zotero-mcp";
   },
 
   // ─── UI Management ─────────────────────────────────────────
@@ -531,10 +899,11 @@ Zotero.ZoteroResearchAssistant = {
 
     const hint = doc.createXULElement("description");
     hint.textContent =
-      'Make sure the backend is running: zotero-mcp serve --transport streamable-http --port 9090';
+      "The backend should auto-start with Zotero. If not, install zotero-mcp (pip install zotero-mcp) or start manually: zotero-mcp plugin-serve";
     hint.style.fontSize = "11px";
     hint.style.marginTop = "8px";
     hint.style.color = "var(--fill-secondary)";
+    hint.style.whiteSpace = "pre-wrap";
     errorBox.appendChild(hint);
 
     container.appendChild(errorBox);
