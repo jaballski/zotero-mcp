@@ -1491,7 +1491,7 @@ class ZRABackendClient {
     } catch (e) {
       if (e.message?.includes("fetch")) {
         throw new Error(
-          "Backend not reachable. Start it with: zotero-mcp serve --transport streamable-http --port 9090"
+          "Backend not reachable. Start it with: zotero-mcp plugin-serve"
         );
       }
       throw e;

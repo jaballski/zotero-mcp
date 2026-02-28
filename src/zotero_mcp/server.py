@@ -2039,6 +2039,137 @@ def chatgpt_connector_search(
         return json.dumps({"results": []}, separators=(",", ":"))
 
 
+# ─── Semantic Search Tools ──────────────────────────────────────────
+# These tools leverage the ChromaDB-backed semantic search index to find
+# items by meaning rather than exact keyword matches.
+
+
+def _get_semantic_search():
+    """Get or create a semantic search instance for MCP tools."""
+    config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+    from zotero_mcp.semantic_search import create_semantic_search
+    return create_semantic_search(str(config_path) if config_path.exists() else None)
+
+
+@mcp.tool(
+    name="zotero_semantic_search",
+    description="Search your Zotero library using semantic similarity (meaning-based) rather than exact keyword matching. Returns items ranked by relevance to the query meaning. Requires the semantic search index to be built first (run 'zotero-mcp update-db')."
+)
+def semantic_search(
+    query: str,
+    limit: int = 10,
+    *,
+    ctx: Context
+) -> str:
+    """
+    Perform semantic search over the Zotero library.
+
+    Args:
+        query: Natural language search query (e.g. "papers about transformer architectures for NLP")
+        limit: Maximum number of results to return (default: 10)
+        ctx: MCP context
+
+    Returns:
+        Markdown-formatted search results ranked by semantic similarity
+    """
+    try:
+        ctx.info(f"Semantic search for: '{query}'")
+        search = _get_semantic_search()
+        results = search.search(query=query, limit=limit)
+
+        if results.get("error"):
+            return f"Semantic search error: {results['error']}\n\nMake sure the index is built by running: `zotero-mcp update-db`"
+
+        items = results.get("results", [])
+        if not items:
+            return f"No semantic matches found for: '{query}'\n\nIf the index is empty, build it with: `zotero-mcp update-db`"
+
+        output = [f"# Semantic Search Results for '{query}'", f"Found {len(items)} results", ""]
+
+        for i, item in enumerate(items, 1):
+            metadata = item.get("metadata", {})
+            zotero_data = item.get("zotero_item", {}).get("data", {})
+            score = item.get("similarity_score", 0)
+
+            title = zotero_data.get("title") or metadata.get("title", "Untitled")
+            creators = format_creators(zotero_data.get("creators", [])) if zotero_data.get("creators") else metadata.get("creators", "")
+            date = zotero_data.get("date") or metadata.get("date", "")
+            item_type = zotero_data.get("itemType") or metadata.get("item_type", "")
+            item_key = item.get("item_key", "")
+
+            output.append(f"## {i}. {title}")
+            output.append(f"**Relevance:** {score:.1%}")
+            output.append(f"**Item Key:** {item_key}")
+            if creators:
+                output.append(f"**Authors:** {creators}")
+            if date:
+                output.append(f"**Date:** {date}")
+            if item_type:
+                output.append(f"**Type:** {item_type}")
+
+            # Abstract from Zotero data
+            abstract = zotero_data.get("abstractNote", "")
+            if abstract:
+                snippet = abstract[:300] + "..." if len(abstract) > 300 else abstract
+                output.append(f"**Abstract:** {snippet}")
+
+            output.append("")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Semantic search error: {str(e)}")
+        return f"Error performing semantic search: {str(e)}\n\nMake sure:\n1. The index is built: `zotero-mcp update-db`\n2. ChromaDB is installed: `pip install chromadb`"
+
+
+@mcp.tool(
+    name="zotero_semantic_search_status",
+    description="Check the status of the semantic search index, including document count, embedding model, and update history."
+)
+def semantic_search_status(
+    *,
+    ctx: Context
+) -> str:
+    """
+    Get the status of the semantic search database.
+
+    Returns:
+        Status information about the semantic search index
+    """
+    try:
+        search = _get_semantic_search()
+        status = search.get_database_status()
+
+        collection_info = status.get("collection_info", {})
+        update_config = status.get("update_config", {})
+
+        output = [
+            "# Semantic Search Database Status",
+            "",
+            f"**Collection:** {collection_info.get('name', 'Unknown')}",
+            f"**Document count:** {collection_info.get('count', 0)}",
+            f"**Embedding model:** {collection_info.get('embedding_model', 'default')}",
+            f"**Database path:** {collection_info.get('persist_directory', 'Unknown')}",
+            "",
+            "## Update Configuration",
+            f"**Auto update:** {update_config.get('auto_update', False)}",
+            f"**Frequency:** {update_config.get('update_frequency', 'manual')}",
+            f"**Last update:** {update_config.get('last_update', 'Never')}",
+            f"**Should update:** {status.get('should_update', False)}",
+        ]
+
+        if collection_info.get("count", 0) == 0:
+            output.append("")
+            output.append("**Note:** The index is empty. Build it with: `zotero-mcp update-db`")
+            output.append("For fulltext indexing (slower but more comprehensive): `zotero-mcp update-db --fulltext`")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        ctx.error(f"Status check error: {str(e)}")
+        return f"Error checking semantic search status: {str(e)}"
+
+
 @mcp.tool(
     name="fetch",
     description="ChatGPT-compatible fetch wrapper. Retrieves fulltext/metadata for a Zotero item by ID."

@@ -106,6 +106,42 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
         return embeddings
 
 
+class OllamaEmbeddingFunction(EmbeddingFunction):
+    """Ollama embedding function for ChromaDB - fully local/offline embeddings."""
+
+    def __init__(self, model_name: str = "nomic-embed-text", base_url: str | None = None):
+        self.model_name = model_name
+        self.base_url = (base_url or os.getenv("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+
+    def name(self) -> str:
+        """Return the name of this embedding function."""
+        return f"ollama-{self.model_name}"
+
+    def __call__(self, input: Documents) -> Embeddings:
+        """Generate embeddings using Ollama API."""
+        import urllib.request
+
+        url = f"{self.base_url}/api/embed"
+        payload = json.dumps({
+            "model": self.model_name,
+            "input": input,
+        }).encode()
+
+        req = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": "application/json"}
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read())
+                return result.get("embeddings", [])
+        except Exception as e:
+            raise ValueError(
+                f"Ollama embedding error (is it running?): {e}. "
+                f"Install Ollama from https://ollama.ai and run: ollama pull {self.model_name}"
+            )
+
+
 class HuggingFaceEmbeddingFunction(EmbeddingFunction):
     """Custom HuggingFace embedding function for ChromaDB using sentence-transformers."""
 
@@ -210,6 +246,11 @@ class ChromaClient:
             base_url = self.embedding_config.get("base_url")
             return GeminiEmbeddingFunction(model_name=model_name, api_key=api_key, base_url=base_url)
 
+        elif self.embedding_model == "ollama":
+            model_name = self.embedding_config.get("model_name", "nomic-embed-text")
+            base_url = self.embedding_config.get("base_url")
+            return OllamaEmbeddingFunction(model_name=model_name, base_url=base_url)
+
         elif self.embedding_model == "qwen":
             model_name = self.embedding_config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
             return HuggingFaceEmbeddingFunction(model_name=model_name)
@@ -218,7 +259,7 @@ class ChromaClient:
             model_name = self.embedding_config.get("model_name", "google/embeddinggemma-300m")
             return HuggingFaceEmbeddingFunction(model_name=model_name)
 
-        elif self.embedding_model not in ["default", "openai", "gemini"]:
+        elif self.embedding_model not in ["default", "openai", "gemini", "ollama"]:
             # Treat any other value as a HuggingFace model name
             return HuggingFaceEmbeddingFunction(model_name=self.embedding_model)
 
@@ -431,6 +472,13 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
             }
             if gemini_base_url:
                 config["embedding_config"]["base_url"] = gemini_base_url
+
+    elif config["embedding_model"] == "ollama":
+        ollama_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        ollama_host = os.getenv("OLLAMA_HOST")
+        config["embedding_config"] = {"model_name": ollama_model}
+        if ollama_host:
+            config["embedding_config"]["base_url"] = ollama_host
 
     return ChromaClient(
         collection_name=config["collection_name"],

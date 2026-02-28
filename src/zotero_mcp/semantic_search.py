@@ -841,7 +841,11 @@ class ZoteroSemanticSearch:
             }
 
     def _enrich_search_results(self, chroma_results: dict[str, Any], query: str) -> list[dict[str, Any]]:
-        """Enrich ChromaDB results with full Zotero item data."""
+        """Enrich ChromaDB results with full Zotero item data.
+
+        Falls back gracefully to ChromaDB metadata if the Zotero API
+        is unavailable (e.g. local-only mode without Zotero running).
+        """
         enriched = []
 
         if not chroma_results.get("ids") or not chroma_results["ids"][0]:
@@ -853,32 +857,38 @@ class ZoteroSemanticSearch:
         metadatas = chroma_results.get("metadatas", [[]])[0]
 
         for i, item_key in enumerate(ids):
-            try:
-                # Get full item data from Zotero
-                zotero_item = self.zotero_client.item(item_key)
+            metadata = metadatas[i] if i < len(metadatas) else {}
+            base_result = {
+                "item_key": item_key,
+                "similarity_score": 1 - distances[i] if i < len(distances) else 0,
+                "matched_text": documents[i] if i < len(documents) else "",
+                "metadata": metadata,
+                "query": query,
+            }
 
-                enriched_result = {
-                    "item_key": item_key,
-                    "similarity_score": 1 - distances[i] if i < len(distances) else 0,
-                    "matched_text": documents[i] if i < len(documents) else "",
-                    "metadata": metadatas[i] if i < len(metadatas) else {},
-                    "zotero_item": zotero_item,
-                    "query": query
+            try:
+                # Try to get full item data from Zotero API
+                zotero_item = self.zotero_client.item(item_key)
+                base_result["zotero_item"] = zotero_item
+            except Exception as e:
+                logger.debug(f"Could not fetch item {item_key} from API, using metadata: {e}")
+                # Build a synthetic zotero_item from ChromaDB metadata so
+                # downstream code (plugin_api search formatting) still works.
+                base_result["zotero_item"] = {
+                    "key": item_key,
+                    "data": {
+                        "title": metadata.get("title", ""),
+                        "itemType": metadata.get("item_type", ""),
+                        "date": metadata.get("date", ""),
+                        "abstractNote": "",
+                        "creators": self._parse_creators_string(metadata.get("creators", "")),
+                        "DOI": metadata.get("doi", ""),
+                        "url": metadata.get("url", ""),
+                        "publicationTitle": metadata.get("publication", ""),
+                    }
                 }
 
-                enriched.append(enriched_result)
-
-            except Exception as e:
-                logger.error(f"Error enriching result for item {item_key}: {e}")
-                # Include basic result even if enrichment fails
-                enriched.append({
-                    "item_key": item_key,
-                    "similarity_score": 1 - distances[i] if i < len(distances) else 0,
-                    "matched_text": documents[i] if i < len(documents) else "",
-                    "metadata": metadatas[i] if i < len(metadatas) else {},
-                    "query": query,
-                    "error": f"Could not fetch full item data: {e}"
-                })
+            enriched.append(base_result)
 
         return enriched
 
